@@ -4,6 +4,7 @@ import { RoutineDB } from '../../src/lib/db';
 import { DEFAULT_TASKS } from '../../src/lib/defaults';
 import { tasksInStage } from '../../src/lib/domain';
 import { newId } from '../../src/lib/id';
+import { AppStore } from '../../src/lib/store';
 import type { StageId } from '../../src/lib/types';
 import { data, isDone, names, openApp, reopen, resetIndexedDB, taskId } from './helpers';
 
@@ -392,5 +393,55 @@ describe('寫入順序與重新同步', () => {
     const again = await reopen(app);
     expect(isDone(again, a.id)).toBe(true);
     expect(isDone(again, b.id)).toBe(true);
+  });
+});
+
+describe('寫入日誌（關閉 App 前一刻的勾選不遺失）', () => {
+  class MemoryStorage {
+    map = new Map<string, string>();
+    getItem = (k: string) => this.map.get(k) ?? null;
+    setItem = (k: string, v: string) => void this.map.set(k, v);
+    removeItem = (k: string) => void this.map.delete(k);
+  }
+  const KEY = 'daily-routine:journal:daily-routine';
+
+  it('每次操作同步寫入日誌，交易完成後清除', async () => {
+    const storage = new MemoryStorage();
+    const app = new AppStore(undefined, storage);
+    await app.init();
+    const id = data(app).tasks[0].id;
+    app.dispatch({ type: 'setDone', taskId: id, done: true, at: 1 });
+    // Synchronously journaled, before IndexedDB has committed anything.
+    expect(JSON.parse(storage.getItem(KEY)!)).toHaveLength(1);
+    await app.whenIdle();
+    expect(storage.getItem(KEY)).toBeNull();
+    app.dispose();
+  });
+
+  it('下次開啟時重播未完成的操作；舊循環的勾選不會套用到新循環', async () => {
+    const storage = new MemoryStorage();
+    const first = new AppStore(undefined, storage);
+    await first.init();
+    const [a, b, c] = data(first).tasks;
+    const cycleId = data(first).cycle.id;
+    first.dispose();
+    // As if the app was killed right after these taps, before the commit.
+    storage.setItem(
+      KEY,
+      JSON.stringify([
+        { op: { type: 'setDone', taskId: a.id, done: true, at: 123 }, cycleId },
+        { op: { type: 'renameTask', taskId: b.id, name: '改過的名字', at: 124 }, cycleId },
+        { op: { type: 'setDone', taskId: c.id, done: true, at: 125 }, cycleId: 'some-older-cycle' },
+      ]),
+    );
+    const second = new AppStore(undefined, storage);
+    await second.init();
+    expect(data(second).cycle.progress[a.id]).toEqual({ done: true, completedAt: 123, subject: null });
+    expect(data(second).tasks.find((t) => t.id === b.id)?.name).toBe('改過的名字');
+    expect(isDone(second, c.id)).toBe(false);
+    expect(storage.getItem(KEY)).toBeNull();
+    // And it is really in IndexedDB now.
+    const third = await reopen(second);
+    expect(isDone(third, a.id)).toBe(true);
   });
 });

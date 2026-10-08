@@ -13,8 +13,27 @@ type ReadyState = Extract<AppState, { status: 'ready' }>;
 interface LoggedOp {
   seq: number;
   op: Op;
+  /** Cycle the op was made in (progress ops are only replayed into the same cycle). */
+  cycleId: string;
   persisted: boolean;
 }
+
+export type JournalStorage = Pick<Storage, 'getItem' | 'setItem' | 'removeItem'>;
+
+interface JournalEntry {
+  op: Op;
+  cycleId: string;
+}
+
+function defaultStorage(): JournalStorage | null {
+  try {
+    return typeof localStorage !== 'undefined' ? localStorage : null;
+  } catch {
+    return null;
+  }
+}
+
+const isProgressOp = (op: Op) => op.type === 'setDone' || op.type === 'setSubject';
 
 function message(err: unknown): string {
   if (err instanceof Error && err.message) return err.message;
@@ -51,7 +70,41 @@ export class AppStore {
   private channel: BroadcastChannel | null = null;
   private readonly tabId = newId();
 
-  constructor(private readonly dbName: string = DB_NAME) {}
+  constructor(
+    private readonly dbName: string = DB_NAME,
+    private readonly journalStorage: JournalStorage | null = defaultStorage(),
+  ) {}
+
+  /*
+   * Write-ahead journal: every op is also written synchronously to localStorage
+   * the moment it is made, and removed once its IndexedDB transaction has
+   * committed. If the app is closed in the few milliseconds before the commit
+   * (tap the last box, swipe the app away), the next launch replays it.
+   */
+  private get journalKey() {
+    return `daily-routine:journal:${this.dbName}`;
+  }
+
+  private writeJournal() {
+    if (!this.journalStorage) return;
+    const entries: JournalEntry[] = this.log.filter((e) => !e.persisted).map((e) => ({ op: e.op, cycleId: e.cycleId }));
+    try {
+      if (entries.length === 0) this.journalStorage.removeItem(this.journalKey);
+      else this.journalStorage.setItem(this.journalKey, JSON.stringify(entries));
+    } catch {
+      /* storage full or unavailable: IndexedDB is still the source of truth */
+    }
+  }
+
+  private readJournal(): JournalEntry[] {
+    try {
+      const raw = this.journalStorage?.getItem(this.journalKey);
+      const v = raw ? JSON.parse(raw) : [];
+      return Array.isArray(v) ? v.filter((e) => e && typeof e === 'object' && e.op && typeof e.op.type === 'string') : [];
+    } catch {
+      return [];
+    }
+  }
 
   subscribe = (fn: () => void): (() => void) => {
     this.listeners.add(fn);
@@ -73,7 +126,18 @@ export class AppStore {
   async init(): Promise<void> {
     try {
       this.db = await RoutineDB.open(this.dbName);
-      const data = await this.enqueue(() => this.db!.loadOrInit(Date.now()));
+      const db = this.db;
+      let data = await this.enqueue(() => db.loadOrInit(Date.now()));
+      const journal = this.readJournal();
+      if (journal.length > 0) {
+        const cycleId = data.cycle.id;
+        const ops = journal.filter((e) => !isProgressOp(e.op) || e.cycleId === cycleId).map((e) => e.op);
+        if (ops.length > 0) {
+          await this.enqueue(() => db.applyOps(ops));
+          data = await this.enqueue(() => db.readAll());
+        }
+        this.journalStorage?.removeItem(this.journalKey);
+      }
       this.set({ status: 'ready', saveError: null, ...data });
     } catch (err) {
       this.set({ status: 'error', error: message(err) });
@@ -142,9 +206,10 @@ export class AppStore {
     if (next === domain) return;
     this.set({ ...s, ...next });
 
-    const entry: LoggedOp = { seq: ++this.seq, op, persisted: false };
+    const entry: LoggedOp = { seq: ++this.seq, op, cycleId: s.cycle.id, persisted: false };
     this.log.push(entry);
     this.batch.push(entry);
+    this.writeJournal();
     if (!this.flushQueued) {
       this.flushQueued = true;
       void this.enqueue(() => this.flush());
@@ -165,12 +230,14 @@ export class AppStore {
       await this.db.applyOps(entries.map((e) => e.op));
     } catch (err) {
       this.log = this.log.filter((e) => !entries.includes(e));
+      this.writeJournal();
       this.patchReady({ saveError: `儲存失敗：${message(err)}。畫面已改回實際保存的內容。` });
       void this.reload();
       return;
     }
     for (const e of entries) e.persisted = true;
     if (!this.reloading) this.log = this.log.filter((e) => !e.persisted);
+    this.writeJournal();
     this.notifyOtherTabs();
   }
 
@@ -250,6 +317,7 @@ export class AppStore {
       throw err;
     });
     this.log = [];
+    this.writeJournal();
     await this.reload();
     this.notifyOtherTabs();
   }

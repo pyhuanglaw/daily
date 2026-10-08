@@ -126,8 +126,7 @@ test.describe('任務操作', () => {
       first[1].click();
     });
     await expect(page.locator('.task.is-done')).toHaveCount(n - 2);
-    // The whole burst is written as one transaction; wait until it has committed (a few ms).
-    await expect(page.locator('html')).not.toHaveAttribute('data-saving');
+    // Reload immediately, without waiting for the write to commit (like closing the app right after tapping).
     await page.reload();
     await expect(page.locator('.task').first()).toBeVisible();
     await expect(page.locator('.task.is-done')).toHaveCount(n - 2);
